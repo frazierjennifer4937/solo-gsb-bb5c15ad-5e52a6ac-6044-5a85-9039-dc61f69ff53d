@@ -60,22 +60,40 @@ CREATE TABLE IF NOT EXISTS roll_expected (
 );
 
 CREATE TABLE IF NOT EXISTS rescan_claims (
-    id          TEXT PRIMARY KEY,
-    roll_no     TEXT NOT NULL,
-    claimant    TEXT NOT NULL,
-    frame_start INTEGER NOT NULL,
-    frame_end   INTEGER NOT NULL,
-    max_frames  INTEGER NOT NULL,
-    ttl_seconds INTEGER NOT NULL,
-    created_at  TEXT NOT NULL,
-    expires_at  TEXT NOT NULL,
-    released_at TEXT,
+    id           TEXT PRIMARY KEY,
+    roll_no      TEXT NOT NULL,
+    claimant     TEXT NOT NULL,
+    frame_start  INTEGER NOT NULL,
+    frame_end    INTEGER NOT NULL,
+    max_frames   INTEGER NOT NULL,
+    ttl_seconds  INTEGER NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    released_at  TEXT,
+    completed_at TEXT,
     CHECK (frame_end >= frame_start),
     CHECK (max_frames  > 0),
     CHECK (ttl_seconds > 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_claims_roll ON rescan_claims (roll_no);
+
+-- 补扫完成回执：一个认领至多一条回执（结案），一个补扫批次号至多绑定一条回执
+CREATE TABLE IF NOT EXISTS rescan_receipts (
+    id                TEXT PRIMARY KEY,
+    claim_id          TEXT NOT NULL,
+    roll_no           TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    raw_frames_json   TEXT NOT NULL,
+    added_frames_json TEXT NOT NULL,
+    duplicates_json   TEXT NOT NULL,
+    created_at        TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_claim
+    ON rescan_receipts (claim_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_batch
+    ON rescan_receipts (batch_id);
 """
 
 
@@ -84,6 +102,7 @@ def init_db() -> None:
 
     旧版库（没有 raw_frames_json 列）通过 ALTER TABLE 平滑升级；
     旧批次该列为 NULL，撤销时据此判定能否安全重建（详见 services.delete_batch）。
+    旧版 rescan_claims 没有 completed_at 列，同样幂等补齐（补扫回执结案标记）。
     """
     conn = _connect()
     try:
@@ -91,6 +110,11 @@ def init_db() -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
         if "raw_frames_json" not in cols:
             conn.execute("ALTER TABLE batches ADD COLUMN raw_frames_json TEXT")
+        claim_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(rescan_claims)").fetchall()
+        }
+        if "completed_at" not in claim_cols:
+            conn.execute("ALTER TABLE rescan_claims ADD COLUMN completed_at TEXT")
     finally:
         conn.close()
 

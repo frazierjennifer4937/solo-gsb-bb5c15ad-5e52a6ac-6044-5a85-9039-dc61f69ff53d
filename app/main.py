@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销与补扫任务认领。",
-    version="1.2.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执。",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -152,10 +152,47 @@ def list_rescan_claims(
 def release_rescan_claim(
     claim_id: str, conn: Connection = Depends(database.get_db)
 ):
-    """释放（删除）一个补扫认领任务；任务不存在、已释放或已到期返回 404。"""
+    """释放（删除）一个补扫认领任务；任务不存在、已释放、已到期或已结案返回 404。"""
     if not services.release_rescan_claim(conn, claim_id.strip()):
-        raise HTTPException(status_code=404, detail="补扫任务不存在、已释放或已到期")
+        raise HTTPException(status_code=404, detail="补扫任务不存在、已释放、已到期或已结案")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(
+    "/rescan-claims/{claim_id}/receipts",
+    response_model=schemas.RescanReceiptOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["补扫认领"],
+)
+def submit_rescan_receipt(
+    claim_id: str,
+    payload: schemas.RescanReceiptIn,
+    response: Response,
+    conn: Connection = Depends(database.get_db),
+):
+    """提交补扫完成回执：认领 ID、补扫批次号与实际扫到的非空帧列表。
+
+    以认领闭区间作为该补扫批次的预期范围，批次导入、回执持久化与认领结案
+    在同一 SQLite 写事务内完成。只接受未到期、未释放、未结案的认领；帧号须在
+    认领闭区间内且提交时仍属该胶卷缺帧，否则 409 且数据不变。相同认领、批次号
+    与原始帧列表的重试返回已存回执（200），不重复导入；变更内容或对已结案认领
+    再提交返回 409。
+    """
+    try:
+        result, code = services.submit_rescan_receipt(conn, claim_id, payload)
+    except services.ClaimNotFoundError:
+        raise HTTPException(status_code=404, detail="补扫任务不存在")
+    except services.ClaimUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except services.ReceiptConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except services.BatchIdConflictError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"batch_id '{e.batch_id}' 已被其他内容占用，请更换后重试",
+        )
+    response.status_code = code
+    return result
 
 
 if __name__ == "__main__":

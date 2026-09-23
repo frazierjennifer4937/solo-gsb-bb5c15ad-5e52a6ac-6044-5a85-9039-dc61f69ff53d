@@ -209,13 +209,84 @@ def get_batch(conn: sqlite3.Connection, batch_id: str) -> schemas.BatchResult | 
     )
 
 
+class BatchIdConflictError(Exception):
+    def __init__(self, batch_id: str):
+        self.batch_id = batch_id
+        super().__init__(f"batch_id 已被其他内容占用: {batch_id}")
+
+
+def _import_batch_tx(
+    conn: sqlite3.Connection,
+    roll_no: str,
+    expected_start: int,
+    expected_end: int,
+    frames_in: list[int],
+    batch_id: str,
+) -> tuple[str, list[int], list[int]]:
+    """在**已开启的写事务内**导入一个批次（批次提交与补扫回执共用）。
+
+    调用方须先持有 BEGIN IMMEDIATE 事务。返回 (batch_id, 新增帧, 重复帧)。
+    若显式 batch_id 已被其他内容占用，抛 BatchIdConflictError（由调用方回滚）。
+    """
+    frames = sorted(set(frames_in))
+    raw_frames = list(frames_in)  # 保留原始帧列表（含批内重复、保序），供撤销时重建
+    digest = content_hash(roll_no, expected_start, expected_end, frames)
+
+    # batch_id 若已被不同内容占用则拒绝（409 在 main 中处理）
+    clash = conn.execute(
+        "SELECT roll_no, content_hash FROM batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+    if clash is not None and (
+        clash["roll_no"] != roll_no or clash["content_hash"] != digest
+    ):
+        raise BatchIdConflictError(batch_id)
+
+    existing_frames = _all_frames(conn, roll_no)
+
+    within_submit: set[int] = set()
+    dup_seen: set[int] = set()
+    for f in frames_in:  # 未去重的原始列表，检出批内重复
+        if f in dup_seen:
+            within_submit.add(f)
+        dup_seen.add(f)
+    # 批内重复 + 该胶卷此前批次已扫到的帧
+    duplicates = sorted(within_submit | (set(frames) & existing_frames))
+    new_frames = sorted(set(frames) - existing_frames)
+
+    conn.execute(
+        """INSERT INTO batches
+           (id, roll_no, expected_start, expected_end, frames_json,
+            raw_frames_json, frames_merged_json, duplicates_json, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            batch_id,
+            roll_no,
+            expected_start,
+            expected_end,
+            json.dumps(frames),
+            json.dumps(raw_frames),
+            json.dumps(new_frames),
+            json.dumps(duplicates),
+            digest,
+        ),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO roll_expected (roll_no, start_no, end_no) VALUES (?, ?, ?)",
+        (roll_no, expected_start, expected_end),
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO roll_frames (roll_no, frame_no, batch_id) VALUES (?, ?, ?)",
+        [(roll_no, f, batch_id) for f in new_frames],
+    )
+    return batch_id, new_frames, duplicates
+
+
 def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schemas.BatchResult, int]:
     """导入一个批次。返回 (结果, HTTP 状态码 201新建 / 200重复)。
 
     幂等保证：(roll_no, 内容指纹) 唯一。相同内容重复导入不写任何数据。
     """
     frames = sorted(set(data.frames))
-    raw_frames = list(data.frames)  # 保留原始帧列表（含批内重复、保序），供撤销时重建
     digest = content_hash(
         data.roll_no, data.expected_start, data.expected_end, frames
     )
@@ -232,55 +303,14 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
             assert result is not None
             return result, 200
 
-        # 客户端自带 batch_id 若已被不同内容占用则拒绝（409 在 main 中处理）
-        if data.batch_id is not None:
-            clash = conn.execute(
-                "SELECT roll_no, content_hash FROM batches WHERE id = ?",
-                (data.batch_id,),
-            ).fetchone()
-            if clash is not None and (
-                clash["roll_no"] != data.roll_no or clash["content_hash"] != digest
-            ):
-                raise BatchIdConflictError(data.batch_id)
-
         batch_id = data.batch_id or f"auto-{uuid.uuid4().hex}"
-
-        existing_frames = _all_frames(conn, data.roll_no)
-
-        within_submit: set[int] = set()
-        dup_seen: set[int] = set()
-        for f in data.frames:  # 未去重的原始列表，检出批内重复
-            if f in dup_seen:
-                within_submit.add(f)
-            dup_seen.add(f)
-        # 批内重复 + 该胶卷此前批次已扫到的帧
-        duplicates = sorted(within_submit | (set(frames) & existing_frames))
-        new_frames = sorted(set(frames) - existing_frames)
-
-        conn.execute(
-            """INSERT INTO batches
-               (id, roll_no, expected_start, expected_end, frames_json,
-                raw_frames_json, frames_merged_json, duplicates_json, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                batch_id,
-                data.roll_no,
-                data.expected_start,
-                data.expected_end,
-                json.dumps(frames),
-                json.dumps(raw_frames),
-                json.dumps(new_frames),
-                json.dumps(duplicates),
-                digest,
-            ),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO roll_expected (roll_no, start_no, end_no) VALUES (?, ?, ?)",
-            (data.roll_no, data.expected_start, data.expected_end),
-        )
-        conn.executemany(
-            "INSERT OR IGNORE INTO roll_frames (roll_no, frame_no, batch_id) VALUES (?, ?, ?)",
-            [(data.roll_no, f, batch_id) for f in new_frames],
+        batch_id, new_frames, duplicates = _import_batch_tx(
+            conn,
+            data.roll_no,
+            data.expected_start,
+            data.expected_end,
+            data.frames,
+            batch_id,
         )
         conn.execute("COMMIT")
     except BatchIdConflictError:
@@ -303,12 +333,6 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
         out_of_range_frames=st["out_of_range"],
     )
     return result, 201
-
-
-class BatchIdConflictError(Exception):
-    def __init__(self, batch_id: str):
-        self.batch_id = batch_id
-        super().__init__(f"batch_id 已被其他内容占用: {batch_id}")
 
 
 # ---------- 批次撤销 ----------
@@ -390,7 +414,8 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
             conn.execute(
                 """UPDATE rescan_claims
                       SET released_at = ?
-                    WHERE roll_no = ? AND released_at IS NULL""",
+                    WHERE roll_no = ? AND released_at IS NULL
+                      AND completed_at IS NULL""",
                 (_now_iso(), roll_no),
             )
             conn.execute("COMMIT")
@@ -457,6 +482,7 @@ _ACTIVE_CLAIMS_SQL = """
       FROM rescan_claims
      WHERE roll_no = ?
        AND released_at IS NULL
+       AND completed_at IS NULL
        AND expires_at > ?
      ORDER BY frame_start, id
 """
@@ -564,7 +590,7 @@ def list_rescan_claims(
 
 
 def release_rescan_claim(conn: sqlite3.Connection, claim_id: str) -> bool:
-    """释放（删除）认领任务；任务不存在、已释放或已到期均返回 False。"""
+    """释放（删除）认领任务；任务不存在、已释放、已到期或已结案均返回 False。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         cur = conn.execute(
@@ -572,6 +598,7 @@ def release_rescan_claim(conn: sqlite3.Connection, claim_id: str) -> bool:
                   SET released_at = ?
                 WHERE id = ?
                   AND released_at IS NULL
+                  AND completed_at IS NULL
                   AND expires_at > ?""",
             (_now_iso(), claim_id, _now_iso()),
         )
@@ -580,3 +607,188 @@ def release_rescan_claim(conn: sqlite3.Connection, claim_id: str) -> bool:
         conn.execute("ROLLBACK")
         raise
     return cur.rowcount > 0
+
+
+# ---------- 补扫完成回执 ----------
+
+class ClaimNotFoundError(Exception):
+    def __init__(self, claim_id: str):
+        self.claim_id = claim_id
+        super().__init__(f"补扫任务不存在: {claim_id}")
+
+
+class ClaimUnavailableError(Exception):
+    """认领已到期或已释放，不能提交回执。"""
+
+
+class ReceiptConflictError(Exception):
+    """帧段越界、帧已不缺、回执内容变更或对已结案认领重复提交等冲突。"""
+
+
+def _receipt_out(
+    conn: sqlite3.Connection,
+    claim: sqlite3.Row,
+    receipt: sqlite3.Row,
+    repeated: bool,
+) -> schemas.RescanReceiptOut:
+    """组装回执响应：remaining 为认领帧段与当前缺帧区间的交集（结案后仍可缩短）。"""
+    st = _state_from_db(conn, claim["roll_no"])
+    remaining = intersect_intervals(
+        st["missing"], [(claim["frame_start"], claim["frame_end"])]
+    )
+    raw_frames = json.loads(receipt["raw_frames_json"])
+    batch = conn.execute(
+        "SELECT frames_merged_json, duplicates_json FROM batches WHERE id = ?",
+        (receipt["batch_id"],),
+    ).fetchone()
+    if batch is not None:
+        added_frames = json.loads(batch["frames_merged_json"])
+        duplicates = json.loads(batch["duplicates_json"])
+    else:  # 回执批次后来被撤销：以回执落库时的快照为准
+        added_frames = json.loads(receipt["added_frames_json"])
+        duplicates = json.loads(receipt["duplicates_json"])
+    return schemas.RescanReceiptOut(
+        id=receipt["id"],
+        claim_id=claim["id"],
+        roll_no=claim["roll_no"],
+        claimant=claim["claimant"],
+        frame_start=claim["frame_start"],
+        frame_end=claim["frame_end"],
+        batch_id=receipt["batch_id"],
+        frames=raw_frames,
+        added_frames=added_frames,
+        duplicates=duplicates,
+        repeated=repeated,
+        remaining_missing_ranges=[list(x) for x in remaining],
+        created_at=receipt["created_at"],
+    )
+
+
+def submit_rescan_receipt(
+    conn: sqlite3.Connection, claim_id: str, data: schemas.RescanReceiptIn
+) -> tuple[schemas.RescanReceiptOut, int]:
+    """提交补扫完成回执，返回 (回执, 201首次 / 200幂等重试)。
+
+    全部动作在同一 BEGIN IMMEDIATE 写事务内完成：以认领闭区间作为补扫批次
+    的预期范围导入批次、持久化回执、将认领置为已结案；任一步失败整体回滚，
+    数据不变。校验规则：
+
+    - 认领记录不存在 → ClaimNotFoundError（404）；
+    - 已到期或已释放 → ClaimUnavailableError（409）；
+    - 每帧必须落在认领闭区间 [frame_start, frame_end] 内，且提交时仍属于
+      该胶卷缺帧 → ReceiptConflictError（409）；
+    - 相同认领、batch_id、原始帧列表的重试：返回已存回执（200），不重复导入；
+    - 内容变更（batch_id 或原始帧列表不同）、对已结案认领再提交新回执、
+      batch_id 已被其他回执/批次占用 → ReceiptConflictError（409）。
+
+    部分补扫时只导入实际扫到的帧，认领结案后帧段内剩余缺帧不再被其占用，
+    立即可被其他人重新认领。
+    """
+    claim_id = claim_id.strip()
+    frames_in = list(data.frames)
+    batch_id = data.batch_id
+    now = _now_iso()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        claim = conn.execute(
+            "SELECT * FROM rescan_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
+        if claim is None:
+            raise ClaimNotFoundError(claim_id)
+
+        existing_receipt = conn.execute(
+            "SELECT * FROM rescan_receipts WHERE claim_id = ?", (claim_id,)
+        ).fetchone()
+
+        # 幂等优先：相同认领 + 相同 batch_id + 相同原始帧列表 → 回已存回执
+        if existing_receipt is not None:
+            if (
+                existing_receipt["batch_id"] == batch_id
+                and json.loads(existing_receipt["raw_frames_json"]) == frames_in
+            ):
+                conn.execute("ROLLBACK")
+                out = _receipt_out(conn, claim, existing_receipt, repeated=True)
+                return out, 200
+            # 对已结案认领提交不同内容（含新 batch_id）→ 冲突，数据不变
+            raise ReceiptConflictError("该认领已结案，回执内容不可变更")
+
+        # 尚无回执但已到期 / 已释放 / 已结案 → 不能再提交
+        if claim["released_at"] is not None or claim["completed_at"] is not None:
+            raise ClaimUnavailableError("补扫任务已释放或已结案")
+        if claim["expires_at"] <= now:
+            raise ClaimUnavailableError("补扫任务已到期")
+
+        # 帧号须在认领闭区间内
+        out_of_claim = [
+            f
+            for f in set(frames_in)
+            if not (claim["frame_start"] <= f <= claim["frame_end"])
+        ]
+        if out_of_claim:
+            raise ReceiptConflictError(
+                f"帧号超出认领区间 [{claim['frame_start']}, {claim['frame_end']}]: "
+                + ", ".join(map(str, sorted(out_of_claim)))
+            )
+
+        # 提交时每帧仍须属于该胶卷缺帧（未被其他批次扫到）
+        already = sorted(set(frames_in) & _all_frames(conn, claim["roll_no"]))
+        if already:
+            raise ReceiptConflictError(
+                "以下帧已不属于该胶卷缺帧（已被扫到）: " + ", ".join(map(str, already))
+            )
+
+        # batch_id 已被其他回执绑定 → 冲突
+        receipt_clash = conn.execute(
+            "SELECT claim_id FROM rescan_receipts WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if receipt_clash is not None:
+            raise ReceiptConflictError(
+                f"batch_id '{batch_id}' 已用于其他补扫回执"
+            )
+
+        # 同一写事务内：以认领闭区间作为批次预期范围导入补扫批次
+        _, new_frames, duplicates = _import_batch_tx(
+            conn,
+            claim["roll_no"],
+            claim["frame_start"],
+            claim["frame_end"],
+            frames_in,
+            batch_id,
+        )
+
+        receipt_id = uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO rescan_receipts
+                   (id, claim_id, roll_no, batch_id, raw_frames_json,
+                    added_frames_json, duplicates_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                receipt_id,
+                claim_id,
+                claim["roll_no"],
+                batch_id,
+                json.dumps(frames_in),
+                json.dumps(new_frames),
+                json.dumps(duplicates),
+                now,
+            ),
+        )
+        # 认领结案：帧段中剩余缺帧立即让出，可被重新认领
+        conn.execute(
+            "UPDATE rescan_claims SET completed_at = ? WHERE id = ?",
+            (now, claim_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    claim = conn.execute(
+        "SELECT * FROM rescan_claims WHERE id = ?", (claim_id,)
+    ).fetchone()
+    receipt = conn.execute(
+        "SELECT * FROM rescan_receipts WHERE id = ?", (receipt_id,)
+    ).fetchone()
+    assert claim is not None and receipt is not None
+    return _receipt_out(conn, claim, receipt, repeated=False), 201
