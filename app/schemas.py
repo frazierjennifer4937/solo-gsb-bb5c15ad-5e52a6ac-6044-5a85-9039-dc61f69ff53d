@@ -110,4 +110,43 @@ class RescanClaimOut(BaseModel):
     )
 
 
+class RescanReceiptIn(BaseModel):
+    batch_id: str = Field(
+        ..., min_length=1, description="本次补扫导入的批次号（必填，沿用批次接口）"
+    )
+    frames: list[int] = Field(
+        ...,
+        min_length=1,
+        description="实际扫到的非空帧号原始列表（至少 1 个；须落在认领闭区间内）",
+    )
+
+    @field_validator("batch_id")
+    @classmethod
+    def _strip_batch_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("batch_id 不能为空")
+        return v
+
+
+class RescanReceiptOut(BaseModel):
+    receipt_id: str
+    claim_id: str
+    roll_no: str
+    batch_id: str
+    frames: list[int] = Field(..., description="回执中的原始帧列表（与提交一致，保序）")
+    added_frames: list[int] = Field(..., description="本批补扫新增的帧号（去重排序）")
+    duplicates: list[int] = Field(..., description="批内重复/此前已扫的帧号（只计一次）")
+    repeated: bool = Field(
+        ..., description="True=相同认领/批次/原始帧列表的回执已存在，本次未做任何更改"
+    )
+    claim_completed: bool = Field(..., description="认领是否随本次回执结案")
+    claim_frame_start: int
+    claim_frame_end: int
+    remaining_missing_ranges: list[list[int]] = Field(
+        ..., description="认领闭区间内目前仍缺失的连续帧段（提交后即时可见）"
+    )
+    created_at: str
+
+
 RollState.model_rebuild()

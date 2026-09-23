@@ -76,6 +76,20 @@ CREATE TABLE IF NOT EXISTS rescan_claims (
 );
 
 CREATE INDEX IF NOT EXISTS idx_claims_roll ON rescan_claims (roll_no);
+
+CREATE TABLE IF NOT EXISTS rescan_receipts (
+    id              TEXT PRIMARY KEY,
+    claim_id        TEXT NOT NULL UNIQUE,
+    roll_no         TEXT NOT NULL,
+    batch_id        TEXT NOT NULL,
+    raw_frames_json TEXT NOT NULL,
+    added_frames_json   TEXT NOT NULL DEFAULT '[]',
+    duplicates_json     TEXT NOT NULL DEFAULT '[]',
+    created_at      TEXT NOT NULL,
+    FOREIGN KEY (claim_id) REFERENCES rescan_claims (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipts_batch ON rescan_receipts (batch_id);
 """
 
 
@@ -84,6 +98,7 @@ def init_db() -> None:
 
     旧版库（没有 raw_frames_json 列）通过 ALTER TABLE 平滑升级；
     旧批次该列为 NULL，撤销时据此判定能否安全重建（详见 services.delete_batch）。
+    rescan_claims 新增 completed_at 列（认领结案时间）同样幂等升级。
     """
     conn = _connect()
     try:
@@ -91,6 +106,11 @@ def init_db() -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
         if "raw_frames_json" not in cols:
             conn.execute("ALTER TABLE batches ADD COLUMN raw_frames_json TEXT")
+        claim_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(rescan_claims)").fetchall()
+        }
+        if "completed_at" not in claim_cols:
+            conn.execute("ALTER TABLE rescan_claims ADD COLUMN completed_at TEXT")
     finally:
         conn.close()
 
